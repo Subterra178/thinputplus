@@ -10,7 +10,7 @@ int WINAPI wWinMain(
     PWSTR,
     int showCommand
 ) {
-    const wchar_t CLASS_NAME[] = L"TH20InputDisplayWindow";
+    const wchar_t CLASS_NAME[] = L"thinput+";
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WindowProc;
@@ -25,7 +25,7 @@ int WINAPI wWinMain(
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOPMOST,
         CLASS_NAME,
-        L"Touhou Input Display",
+        L"thinput+",
         WS_POPUP,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
