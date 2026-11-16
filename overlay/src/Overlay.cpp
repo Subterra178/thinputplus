@@ -4,6 +4,7 @@
 #include <tlhelp32.h>
 #include <cstdint>
 #include <cstddef>
+#include <cstdarg>
 #include <cwchar>
 #include <cmath>
 #include <cstdio>
@@ -16,15 +17,35 @@
 namespace {
     using EndSceneFn = HRESULT (WINAPI*)(IDirect3DDevice9 *);
     using ResetFn = HRESULT (WINAPI*)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
+    using CreateDeviceFn = HRESULT (WINAPI*)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD,
+                                             D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **);
 
     EndSceneFn g_originalEndScene = nullptr;
     ResetFn g_originalReset = nullptr;
+    CreateDeviceFn g_originalCreateDevice = nullptr;
     volatile LONG g_installed = 0;
     volatile LONG g_debugVisible = 0;
     bool g_f12WasDown = false;
     const GameProfile *g_profile = nullptr;
     volatile LONG g_lastInput = 0;
     HINSTANCE g_dllInstance = nullptr;
+
+    FILE *g_log = nullptr;
+
+    void Log(const wchar_t *fmt, ...) {
+        if (!g_log)
+            return;
+        wchar_t message[512]{};
+        va_list args;
+        va_start(args, fmt);
+        vswprintf(message, 512, fmt, args);
+        va_end(args);
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        fwprintf(g_log, L"[%02u:%02u:%02u.%03u] %ls\n",
+                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, message);
+        fflush(g_log);
+    }
 
     struct OverlayConfig {
         float x = -1.0f;
@@ -457,12 +478,19 @@ namespace {
 
         std::uint16_t inputValue = 0;
         SIZE_T bytesRead = 0;
+        static bool loggedRender = false;
         if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address),
                               &inputValue, sizeof(inputValue), &bytesRead) &&
             bytesRead == sizeof(inputValue)) {
             InterlockedExchange(&g_lastInput, inputValue);
         } else {
             InterlockedExchange(&g_lastInput, 0);
+        }
+        if (!loggedRender) {
+            loggedRender = true;
+            Log(L"RenderOverlay first call: address=0x%zx base=0x%zx read=%ls",
+                address, base,
+                (bytesRead == sizeof(inputValue)) ? L"ok" : L"failed");
         }
 
         const std::uint16_t state = static_cast<std::uint16_t>(InterlockedCompareExchange(&g_lastInput, 0, 0));
@@ -540,6 +568,11 @@ namespace {
     }
 
     HRESULT WINAPI HookEndScene(IDirect3DDevice9 *device) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log(L"EndScene hooked, device=%p", reinterpret_cast<void *>(device));
+        }
         RenderOverlay(device);
         return g_originalEndScene ? g_originalEndScene(device) : D3D_OK;
     }
@@ -548,11 +581,71 @@ namespace {
         return g_originalReset ? g_originalReset(device, params) : D3DERR_INVALIDCALL;
     }
 
+    bool PatchVtable(void **table, std::size_t index, void *replacement, void **original);
+
+    HRESULT WINAPI HookCreateDevice(IDirect3D9 *api, UINT adapter, D3DDEVTYPE type,
+                                    HWND focusWindow, DWORD behaviorFlags,
+                                    D3DPRESENT_PARAMETERS *params, IDirect3DDevice9 **device) {
+        CreateDeviceFn original = g_originalCreateDevice;
+        if (!original)
+            return D3DERR_INVALIDCALL;
+        const HRESULT hr = original(api, adapter, type, focusWindow, behaviorFlags, params, device);
+        Log(L"CreateDevice called: adapter=%u type=%d flags=%lx hwnd=%p -> hr=0x%lx device=%p",
+            adapter, static_cast<int>(type), behaviorFlags,
+            reinterpret_cast<void *>(focusWindow), static_cast<unsigned long>(hr),
+            (device && SUCCEEDED(hr)) ? reinterpret_cast<void *>(*device) : nullptr);
+        if (SUCCEEDED(hr) && device && *device) {
+            void **deviceTable = *reinterpret_cast<void ***>(*device);
+            PatchVtable(deviceTable, 16, reinterpret_cast<void *>(HookReset),
+                        reinterpret_cast<void **>(&g_originalReset));
+            PatchVtable(deviceTable, 42, reinterpret_cast<void *>(HookEndScene),
+                        reinterpret_cast<void **>(&g_originalEndScene));
+
+            void **apiTable = *reinterpret_cast<void ***>(api);
+            PatchVtable(apiTable, 15, reinterpret_cast<void *>(original), nullptr);
+            g_originalCreateDevice = nullptr;
+            InterlockedExchange(&g_installed, 1);
+            Log(L"Device vtable hooked (EndScene/Reset)");
+        }
+        return hr;
+    }
+
+    bool ArmCreateDeviceHook() {
+        HMODULE d3d9 = LoadLibraryW(L"d3d9.dll");
+        if (!d3d9) {
+            Log(L"ArmCreateDeviceHook: LoadLibraryW(d3d9.dll) failed: %lu", GetLastError());
+            return false;
+        }
+        wchar_t d3d9Path[MAX_PATH]{};
+        GetModuleFileNameW(d3d9, d3d9Path, MAX_PATH);
+        using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
+        auto create9 = reinterpret_cast<Direct3DCreate9Fn>(GetProcAddress(d3d9, "Direct3DCreate9"));
+        if (!create9) {
+            Log(L"ArmCreateDeviceHook: Direct3DCreate9 not found in %ls", d3d9Path);
+            return false;
+        }
+        IDirect3D9 *api = create9(D3D_SDK_VERSION);
+        if (!api) {
+            Log(L"ArmCreateDeviceHook: Direct3DCreate9 returned null (%ls)", d3d9Path);
+            return false;
+        }
+        void **table = *reinterpret_cast<void ***>(api);
+        const bool ok = PatchVtable(table, 15, reinterpret_cast<void *>(HookCreateDevice),
+                                    reinterpret_cast<void **>(&g_originalCreateDevice));
+        Log(L"ArmCreateDeviceHook: d3d9=%ls api=%p armed=%d", d3d9Path,
+            reinterpret_cast<void *>(api), ok ? 1 : 0);
+        api->Release();
+        return ok;
+    }
+
     bool PatchVtable(void **table, std::size_t index, void *replacement, void **original) {
+        if (table[index] == replacement)
+            return true;
         DWORD oldProtect = 0;
         if (!VirtualProtect(&table[index], sizeof(void *), PAGE_EXECUTE_READWRITE, &oldProtect))
             return false;
-        *original = table[index];
+        if (original)
+            *original = table[index];
         table[index] = replacement;
         DWORD ignored = 0;
         VirtualProtect(&table[index], sizeof(void *), oldProtect, &ignored);
@@ -565,6 +658,8 @@ namespace {
     }
 
     bool InstallHooks() {
+        if (InterlockedCompareExchange(&g_installed, 0, 0))
+            return true;
         HMODULE d3d9 = LoadLibraryW(L"d3d9.dll");
         if (!d3d9)
             return false;
@@ -594,12 +689,20 @@ namespace {
         IDirect3DDevice9 *device = nullptr;
         HRESULT hr = api->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window,
                                        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &device);
+        Log(L"InstallHooks: HAL CreateDevice hr=0x%lx", static_cast<unsigned long>(hr));
         if (FAILED(hr)) {
             hr = api->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_REF, window,
                                    D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &device);
+            Log(L"InstallHooks: REF CreateDevice hr=0x%lx", static_cast<unsigned long>(hr));
         }
         if (FAILED(hr) || !device)
             return false;
+        if (InterlockedCompareExchange(&g_installed, 0, 0)) {
+            device->Release();
+            api->Release();
+            DestroyWindow(window);
+            return true;
+        }
 
         void **table = *reinterpret_cast<void ***>(device);
         const bool resetOk = PatchVtable(table, 16, reinterpret_cast<void *>(HookReset),
@@ -618,13 +721,26 @@ namespace {
         const wchar_t *exeName = wcsrchr(exePath, L'\\');
         exeName = exeName ? exeName + 1 : exePath;
         g_profile = FindGameProfile(exeName);
-        if (!g_profile)
+        if (!g_profile) {
+            Log(L"InitThread: no profile for %ls", exeName);
             return 0;
+        }
 
+        wchar_t logPath[MAX_PATH]{};
+        if (GetDllDirectory(logPath, MAX_PATH))
+            wcscat_s(logPath, L"thinput_overlay.log");
+        g_log = _wfopen(logPath, L"w");
+        Log(L"--- attach: exe=%ls profile=%ls", exePath, g_profile->exeName);
+
+        const bool armed = ArmCreateDeviceHook();
         for (int attempt = 0; attempt < 100; ++attempt) {
-            if (InstallHooks()) {
-                InterlockedExchange(&g_installed, 1);
+            if (InterlockedCompareExchange(&g_installed, 0, 0))
                 return 0;
+            if (!armed || attempt >= 20) {
+                if (InstallHooks()) {
+                    InterlockedExchange(&g_installed, 1);
+                    return 0;
+                }
             }
             Sleep(250);
         }
