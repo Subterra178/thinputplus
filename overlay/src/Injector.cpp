@@ -8,6 +8,48 @@
 #include "config/GameProfiles.h"
 
 namespace {
+    bool GetOwnDirectory(wchar_t *directory, DWORD capacity) {
+        wchar_t path[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, path, MAX_PATH))
+            return false;
+        wchar_t *slash = wcsrchr(path, L'\\');
+        if (!slash)
+            return false;
+        *slash = L'\0';
+        return swprintf(directory, capacity, L"%ls\\", path) >= 0;
+    }
+
+    const GameProfile *FindGameInDirectory(const wchar_t *directory) {
+        for (const auto &profile: GAME_PROFILES) {
+            wchar_t path[MAX_PATH]{};
+            if (swprintf(path, MAX_PATH, L"%ls%ls", directory, profile.exeName) < 0)
+                continue;
+            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+                return &profile;
+        }
+        return nullptr;
+    }
+
+    bool LaunchGame(const GameProfile *profile, const wchar_t *directory,
+                    DWORD *pid, HANDLE *process) {
+        wchar_t path[MAX_PATH]{};
+        if (swprintf(path, MAX_PATH, L"%ls%ls", directory, profile->exeName) < 0)
+            return false;
+
+        STARTUPINFOW startupInfo{};
+        startupInfo.cb = sizeof(startupInfo);
+        PROCESS_INFORMATION processInfo{};
+        if (!CreateProcessW(path, nullptr, nullptr, nullptr, FALSE, 0,
+                            nullptr, directory, &startupInfo, &processInfo)) {
+            return false;
+        }
+        CloseHandle(processInfo.hThread);
+        WaitForInputIdle(processInfo.hProcess, 5000);
+        *pid = processInfo.dwProcessId;
+        *process = processInfo.hProcess;
+        return true;
+    }
+
     DWORD FindTarget(const GameProfile **foundProfile) {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snapshot == INVALID_HANDLE_VALUE)
@@ -50,10 +92,25 @@ namespace {
 
 int wmain(int argc, wchar_t **argv) {
     const GameProfile *profile = nullptr;
-    const DWORD pid = FindTarget(&profile);
+    DWORD pid = FindTarget(&profile);
+    HANDLE launchedProcess = nullptr;
+
     if (!pid || !profile) {
-        fwprintf(stderr, L"Supported Touhou process was not found.\n");
-        return 1;
+        wchar_t directory[MAX_PATH]{};
+        if (!GetOwnDirectory(directory, MAX_PATH)) {
+            fwprintf(stderr, L"Supported Touhou process was not found.\n");
+            return 1;
+        }
+        profile = FindGameInDirectory(directory);
+        if (!profile) {
+            fwprintf(stderr, L"Supported Touhou process was not found and no game executable is next to the injector.\n");
+            return 1;
+        }
+        if (!LaunchGame(profile, directory, &pid, &launchedProcess)) {
+            fwprintf(stderr, L"Could not launch %ls: %lu\n", profile->exeName, GetLastError());
+            return 1;
+        }
+        wprintf(L"Launched %ls (PID %lu).\n", profile->exeName, pid);
     }
 
     wchar_t dllPath[MAX_PATH]{};
@@ -70,8 +127,10 @@ int wmain(int argc, wchar_t **argv) {
         wcscat_s(dllPath, L"thinput_overlay.dll");
     }
 
-    HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
-                                 PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    HANDLE process = launchedProcess;
+    if (!process)
+        process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                              PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
     if (!process) {
         fwprintf(stderr, L"OpenProcess failed: %lu\n", GetLastError());
         return 3;
